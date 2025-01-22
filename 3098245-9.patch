@@ -1,0 +1,150 @@
+From 0a7aed381e89c370741de598fd1698d0e26005c8 Mon Sep 17 00:00:00 2001
+From: Arnab Roy <arnab.roy@airbus.com>
+Date: Mon, 20 Jan 2025 07:42:41 +0100
+Subject: [PATCH] Fix Nested Block for Entity Reference.
+
+---
+ .../FieldWidget/LayoutBuilderCopyWidget.php   | 101 +++++++++++-------
+ 1 file changed, 65 insertions(+), 36 deletions(-)
+
+diff --git a/src/Plugin/Field/FieldWidget/LayoutBuilderCopyWidget.php b/src/Plugin/Field/FieldWidget/LayoutBuilderCopyWidget.php
+index 7b2d9bb..19d8531 100644
+--- a/src/Plugin/Field/FieldWidget/LayoutBuilderCopyWidget.php
++++ b/src/Plugin/Field/FieldWidget/LayoutBuilderCopyWidget.php
+@@ -256,20 +256,23 @@ class LayoutBuilderCopyWidget extends WidgetBase {
+ 
+             /** @var \Drupal\block_content\BlockContentInterface $block */
+             /** @var \Drupal\block_content\BlockContentInterface $replicated_block */
+-            $block = \Drupal::service('entity_type.manager')->getStorage('block_content')->loadRevision($configuration['block_revision_id']);
+-            $replicated_block = $this->cloneEntity('block_content', $block->id());
+-            if ($replicated_block) {
+-              $replicated_block->set('langcode', $entity->language()->getId());
+-              $replicated_block->save();
+-              $configuration = $this->updateComponentConfiguration($configuration, $replicated_block);
+-              $cloned_component->setConfiguration($configuration);
+-
+-              // Store usage.
+-              \Drupal::service('inline_block.usage')->addUsage($replicated_block->id(), $entity);
+-            }
+-            else {
+-              $add_component = FALSE;
+-              $this->messenger()->addMessage($this->t('The inline block "@label" was not duplicated.', ['@label' => $block->label()]));
++            $block_content_storage = \Drupal::service('entity_type.manager')->getStorage('block_content');
++            if (!empty($configuration['block_revision_id'])) {
++              $block = !is_null($configuration['block_revision_id']) ? $block_content_storage->loadRevision($configuration['block_revision_id']) : $block_content_storage->load($configuration['block_id']);
++              $replicated_block = $this->cloneEntity('block_content', $block->id(), $entity);
++              if ($replicated_block) {
++                $replicated_block->set('langcode', $entity->language()->getId());
++                $replicated_block->save();
++                $configuration = $this->updateComponentConfiguration($configuration, $replicated_block);
++                $cloned_component->setConfiguration($configuration);
++
++                // Store usage.
++                \Drupal::service('inline_block.usage')->addUsage($replicated_block->id(), $entity);
++              }
++              else {
++                $add_component = FALSE;
++                $this->messenger()->addMessage($this->t('The inline block "@label" was not duplicated.', ['@label' => $block->label()]));
++              }
+             }
+           }
+ 
+@@ -295,10 +298,11 @@ class LayoutBuilderCopyWidget extends WidgetBase {
+    *
+    * @param $entity_type_id
+    * @param $entity_id
++   * @param ContentEntityInterface $layout_entity
+    *
+    * @return \Drupal\Core\Entity\EntityInterface|NULL
+   */
+-  protected function cloneEntity($entity_type_id, $entity_id) {
++  protected function cloneEntity($entity_type_id, $entity_id, ContentEntityInterface $layout_entity) {
+     $clone = NULL;
+ 
+     try {
+@@ -306,31 +310,16 @@ class LayoutBuilderCopyWidget extends WidgetBase {
+       /** @var \Drupal\Core\Entity\EntityInterface $clone */
+       $entity = \Drupal::service('entity_type.manager')->getStorage($entity_type_id)->load($entity_id);
+       $clone = $entity->createDuplicate();
++      $clone->set('langcode', $layout_entity->language()->getId());
+ 
+       /** @var \Drupal\Core\Field\FieldDefinitionInterface[] $field_definitions */
+       $field_definitions = \Drupal::service('entity_field.manager')->getFieldDefinitions($entity->getEntityTypeId(), $entity->bundle());
+       foreach ($field_definitions as $definition) {
+-
+-        // Support for Entity reference revisions.
+-        if ($definition->getFieldStorageDefinition()->getType() == 'entity_reference_revisions') {
+-          $new_values = [];
+-          $target_type = $definition->getFieldStorageDefinition()->getSetting('target_type');
+-          $values = $clone->get($definition->getName())->getValue();
+-          if (!empty($values)) {
+-            foreach ($values as $value) {
+-              /** @var \Drupal\Core\Entity\EntityInterface $reference */
+-              /** @var \Drupal\Core\Entity\EntityInterface $reference_clone */
+-              $reference = \Drupal::service('entity_type.manager')->getStorage($target_type)->load($value['target_id']);
+-              $reference_clone = $reference->createDuplicate();
+-              $reference_clone->save();
+-              $new_values[] = [
+-                'target_id' => $reference_clone->id(),
+-                'target_revision_id' => $reference_clone->getRevisionId(),
+-              ];
+-            }
+-
+-            if (!empty($new_values)) {
+-              $clone->set($definition->getName(), $new_values);
++        if ($definition->getFieldStorageDefinition()->getType() === 'entity_reference') {
++          // Support for Entity reference fields that target inline blocks.
++          if (!empty($definition->getSetting('target_type'))) {
++            if ($definition->getSetting('target_type') === 'block_content') {
++              $this->handleInlineBlockEntityReferences($clone, $definition, $layout_entity);
+             }
+           }
+         }
+@@ -369,4 +358,44 @@ class LayoutBuilderCopyWidget extends WidgetBase {
+     $configuration["block_revision_id"] = $replicated_block->getRevisionId();
+     return $configuration;
+   }
++
++  /**
++   * Clone the targets of entity reference fields if they are inline blocks.
++   *
++   * @param Drupal\Core\Entity\EntityInterface $clone
++   *   The cloned entity, which still has the same entity reference targets as
++   *   the original.
++   * @param Drupal\Core\Field\FieldDefinitionInterface $definition
++   *   The field definition of type entity_reference.
++   * @param ContentEntityInterface $layout_entity
++   *   Then entity with a layout that will include $clone.
++   */
++  protected function handleInlineBlockEntityReferences($clone, $definition, $layout_entity): void {
++    $fieldItems = $clone->get($definition->getName());
++    if ($fieldItems->isEmpty()) {
++      return;
++    }
++
++    $nested_blocks = $fieldItems->referencedEntities();
++    $new_values = [];
++    foreach ($nested_blocks as $nested_block) {
++      $langcode = $layout_entity->language()->getId();
++      $hasTranslation_block = $nested_block->hasTranslation($langcode);
++      if ($hasTranslation_block === FALSE) {
++        $nested_clone = $nested_block->addTranslation($langcode, $nested_block->toArray());
++        $nested_clone->save();
++        \Drupal::service('inline_block.usage')->addUsage($nested_clone->id(), $layout_entity);
++        $new_values[] = [
++          'target_id' => $nested_clone->id(),
++        ];
++      }
++    }
++
++    $mlangcode = $layout_entity->language()->getId();
++    $hasTranslation = $clone->hasTranslation($mlangcode);
++    if (!empty($new_values) && $hasTranslation === FALSE) {
++      $clone->set($definition->getName(), $new_values);
++    }
++  }
++
+ }
+-- 
+2.45.1.windows.1
+
